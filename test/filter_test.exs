@@ -628,6 +628,21 @@ defmodule AshPostgres.FilterTest do
                |> Ash.Query.filter(contains(comments.title, ^"bb"))
                |> Ash.read!()
     end
+
+    test "a backslash in the search term is treated as a literal, not a LIKE escape" do
+      for title <- ["prefix\\%literal", "prefix\\secret", "prefix-without-backslash"] do
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: title})
+        |> Ash.create!()
+      end
+
+      # Searching for the literal substring "\%" must match only the row that
+      # contains it, not every row with a backslash (LIKE-wildcard injection).
+      assert [%{title: "prefix\\%literal"}] =
+               Post
+               |> Ash.Query.filter(contains(title, ^"\\%"))
+               |> Ash.read!()
+    end
   end
 
   describe "string_starts_with?/2" do
@@ -825,6 +840,34 @@ defmodule AshPostgres.FilterTest do
       assert [%{title: "match"}] =
                Post
                |> Ash.Query.filter(exists(comments, title == ^"abba"))
+               |> Ash.read!()
+    end
+
+    test "a predicate is not dropped when the relationship has a limit and a parent() filter" do
+      post =
+        Post
+        |> Ash.Changeset.for_create(:create, %{title: "match", score: 0})
+        |> Ash.create!()
+
+      # The only qualifying child (likes > parent score) does not satisfy the predicate.
+      Comment
+      |> Ash.Changeset.for_create(:create, %{title: "denied", likes: 1})
+      |> Ash.Changeset.manage_relationship(:post, post, type: :append_and_remove)
+      |> Ash.create!()
+
+      assert [] =
+               Post
+               |> Ash.Query.filter(exists(limited_comments_over_score, title == ^"allowed"))
+               |> Ash.read!()
+
+      Comment
+      |> Ash.Changeset.for_create(:create, %{title: "allowed", likes: 2})
+      |> Ash.Changeset.manage_relationship(:post, post, type: :append_and_remove)
+      |> Ash.create!()
+
+      assert [%{title: "match"}] =
+               Post
+               |> Ash.Query.filter(exists(limited_comments_over_score, title == ^"allowed"))
                |> Ash.read!()
     end
 
