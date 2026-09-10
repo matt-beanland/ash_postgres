@@ -1957,7 +1957,7 @@ defmodule AshPostgres.DataLayer do
                       repo,
                       Map.delete(query, :__ash_bindings__),
                       resource,
-                      temporal_from_bound(query, changeset)
+                      temporal_portion(query, changeset)
                     )
                   else
                     repo.update_all(
@@ -2271,7 +2271,7 @@ defmodule AshPostgres.DataLayer do
                   repo,
                   query,
                   resource,
-                  temporal_from_bound(query, changeset)
+                  temporal_portion(query, changeset)
                 )
               else
                 repo.delete_all(
@@ -2857,24 +2857,35 @@ defmodule AshPostgres.DataLayer do
     end)
   end
 
-  # The `FOR PORTION OF` lower bound for a temporal mutation. Prefer the query's
-  # threaded `as_of` (set for both single and bulk operations); fall back to the
-  # changeset's `as_of` (single) and finally the wall clock.
+  # The `FOR PORTION OF` portion for a temporal mutation. Prefer the query's threaded
+  # `as_of` (set for both single and bulk operations); fall back to the changeset's
+  # `as_of` (single) and finally the wall clock.
+  # ⭐ Returns a PERIOD, not an instant: an instant-valued `as_of` gives `[as_of, ∞)`
+  # and a range names the portion outright. A caller wanting the instant narrows it —
+  # `set_as_of/3` does, because a read has only an instant to narrow to.
   # Upserts can't be expressed on a `WITHOUT OVERLAPS` table (Postgres has no
-  # `ON CONFLICT` for GiST exclusion constraints). A temporal write is always
-  # `[as_of, ∞)`; use create or update instead.
-  defp temporal_from_bound(query, changeset) do
+  # `ON CONFLICT` for GiST exclusion constraints); use create or update instead.
+  defp temporal_portion(query, changeset) do
     bindings = Map.get(query, :__ash_bindings__) || %{}
 
-    case get_in(bindings, [:context, :private, :as_of]) || changeset.as_of do
-      nil -> now_in_extent(changeset.resource)
-      as_of -> Ash.Temporal.resolve_as_of(as_of)
+    # A PERIOD survives only on the changeset. The query's threaded `as_of` is already
+    # narrowed to an instant, because that is what the read filter needs, so sourcing the
+    # portion from there would silently drop the upper bound a write was given.
+    case changeset.as_of do
+      %Ash.Range{} = period ->
+        period
+
+      as_of ->
+        case get_in(bindings, [:context, :private, :as_of]) || as_of do
+          nil -> now_in_extent(changeset.resource)
+          resolved -> Ash.Temporal.resolve_as_of(resolved)
+        end
     end
   end
 
   # Through the surface rather than `DateTime.utc_now()`, so the rule has one home and a
-  # declared precision is honoured. ⚠️ Behaviour-neutral for every temporal resource this
-  # layer can hold today — the period column is `tstzrange`, so the extent is always a
+  # declared precision is honoured. Behaviour-neutral for every temporal resource this
+  # layer can hold today: the period column is `tstzrange`, so the extent is always a
   # datetime, and the default precision is already microsecond.
   defp now_in_extent(resource) do
     case Ash.Temporal.write_instant(resource, :now) do
@@ -2886,7 +2897,7 @@ defmodule AshPostgres.DataLayer do
   # A temporal create establishes the period `as_of` names. The period attribute is never
   # accepted as input; the data layer sets it here.
   #
-  # `Ash.Temporal.write_period/2` owns the rule — an instant means `[instant, ∞)`, a range
+  # `Ash.Temporal.write_period/2` owns the rule: an instant means `[instant, ∞)`, a range
   # means itself. Hand-writing it here is what let a bounded `as_of` be stored as
   # `[lower, ∞)`, so the record answered reads beyond the period it named.
   defp maybe_put_temporal_period(attributes, nil, _changeset), do: attributes
@@ -4249,7 +4260,7 @@ defmodule AshPostgres.DataLayer do
         # alone matches every period of the id), and `update_query` splits it via
         # FOR PORTION OF. Scope to that period with `valid_at @> as_of`.
         if Ash.Resource.Info.temporal?(resource) do
-          {:ok, query} = set_as_of(resource, query, temporal_from_bound(query, changeset))
+          {:ok, query} = set_as_of(resource, query, temporal_portion(query, changeset))
           query
         else
           query
@@ -4376,7 +4387,7 @@ defmodule AshPostgres.DataLayer do
                 # A temporal destroy ends validity from `as_of` forward on the
                 # period valid at `as_of` (NOT the whole `id` timeline), via
                 # DELETE FOR PORTION OF. Scope to that period with `valid_at @> as_of`.
-                as_of = temporal_from_bound(query, changeset)
+                as_of = temporal_portion(query, changeset)
                 {:ok, query} = set_as_of(resource, query, as_of)
                 AshPostgres.Temporal.delete_all(repo, query, resource, as_of)
               else
