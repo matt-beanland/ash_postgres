@@ -1003,7 +1003,7 @@ defmodule AshPostgres.DataLayer do
     # range containment predicate: `valid_at @> $as_of`. Postgres has no native
     # AS OF / system-versioning, so this is the idiomatic mechanism, and the
     # GiST index backing the temporal PK makes it index-supported.
-    as_of = Ash.Query.resolve_as_of(as_of)
+    as_of = Ash.Temporal.resolve_as_of(as_of)
 
     if Ash.Resource.Info.temporal_strategy(resource) == :context && as_of do
       import Ecto.Query, only: [from: 2]
@@ -2889,13 +2889,13 @@ defmodule AshPostgres.DataLayer do
     Map.put(attributes, temporal_attribute, written_period(changeset.as_of))
   end
 
-  # ⛔ Not `Ash.Query.resolve_as_of/1` for a range: that narrows to the lower bound,
+  # ⛔ Not `Ash.Temporal.resolve_as_of/1` for a range: that narrows to the lower bound,
   # which is what a READ needs and discards the upper a write was given.
   defp written_period(%Ash.Range{} = as_of), do: as_of
 
   defp written_period(as_of) do
     %Ash.Range{
-      lower: Ash.Query.resolve_as_of(as_of) || DateTime.utc_now(),
+      lower: Ash.Temporal.resolve_as_of(as_of) || DateTime.utc_now(),
       upper: nil,
       bounds: :"[)"
     }
@@ -2961,7 +2961,7 @@ defmodule AshPostgres.DataLayer do
 
     as_of =
       case changesets do
-        [changeset | _] -> Ash.Query.resolve_as_of(changeset.as_of)
+        [changeset | _] -> Ash.Temporal.resolve_as_of(changeset.as_of)
         _ -> nil
       end
 
@@ -4022,7 +4022,7 @@ defmodule AshPostgres.DataLayer do
       touch_update_defaults? =
         changeset.context[:private][:touch_update_defaults?] != false
 
-      update_defaults = update_defaults(resource, Ash.Query.resolve_as_of(changeset.as_of))
+      update_defaults = update_defaults(resource, Ash.Temporal.resolve_as_of(changeset.as_of))
 
       explicitly_changing_attributes =
         changeset.attributes
