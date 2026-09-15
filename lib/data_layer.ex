@@ -2868,37 +2868,45 @@ defmodule AshPostgres.DataLayer do
   defp temporal_portion(query, changeset) do
     bindings = Map.get(query, :__ash_bindings__) || %{}
 
-    # ⛔ A PERIOD survives only on the changeset. Ash stores the query's threaded `as_of`
-    # as `resolve_as_of(as_of)` — already narrowed to an instant, because that is what the
-    # read filter needs — so sourcing the portion from there silently drops the upper.
+    # A PERIOD survives only on the changeset. The query's threaded `as_of` is already
+    # narrowed to an instant, because that is what the read filter needs, so sourcing the
+    # portion from there would silently drop the upper bound a write was given.
     case changeset.as_of do
       %Ash.Range{} = period ->
         period
 
       as_of ->
-        written_period(get_in(bindings, [:context, :private, :as_of]) || as_of)
+        case get_in(bindings, [:context, :private, :as_of]) || as_of do
+          nil -> now_in_extent(changeset.resource)
+          resolved -> Ash.Temporal.resolve_as_of(resolved)
+        end
     end
   end
 
-  # A temporal create establishes the period `as_of` names. An INSTANT opens one at it
-  # and leaves it unbounded — `[as_of, ∞)`; a RANGE names both bounds outright. The
-  # period attribute is never accepted as input; the data layer sets it here.
+  # Through the surface rather than `DateTime.utc_now()`, so the rule has one home and a
+  # declared precision is honoured. Behaviour-neutral for every temporal resource this
+  # layer can hold today: the period column is `tstzrange`, so the extent is always a
+  # datetime, and the default precision is already microsecond.
+  defp now_in_extent(resource) do
+    case Ash.Temporal.write_instant(resource, :now) do
+      {:ok, instant} -> instant
+      :error -> DateTime.utc_now()
+    end
+  end
+
+  # A temporal create establishes the period `as_of` names. The period attribute is never
+  # accepted as input; the data layer sets it here.
+  #
+  # `Ash.Temporal.write_period/2` owns the rule: an instant means `[instant, ∞)`, a range
+  # means itself. Hand-writing it here is what let a bounded `as_of` be stored as
+  # `[lower, ∞)`, so the record answered reads beyond the period it named.
   defp maybe_put_temporal_period(attributes, nil, _changeset), do: attributes
 
   defp maybe_put_temporal_period(attributes, temporal_attribute, changeset) do
-    Map.put(attributes, temporal_attribute, written_period(changeset.as_of))
-  end
-
-  # ⛔ Not `Ash.Temporal.resolve_as_of/1` for a range: that narrows to the lower bound,
-  # which is what a READ needs and discards the upper a write was given.
-  defp written_period(%Ash.Range{} = as_of), do: as_of
-
-  defp written_period(as_of) do
-    %Ash.Range{
-      lower: Ash.Temporal.resolve_as_of(as_of) || DateTime.utc_now(),
-      upper: nil,
-      bounds: :"[)"
-    }
+    case Ash.Temporal.write_period(changeset.resource, changeset.as_of) do
+      {:ok, period} -> Map.put(attributes, temporal_attribute, period)
+      :error -> attributes
+    end
   end
 
   defp with_savepoint(
