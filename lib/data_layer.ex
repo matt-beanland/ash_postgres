@@ -307,6 +307,14 @@ defmodule AshPostgres.DataLayer do
         doc:
           "Whether or not to include this resource in the generated migrations with `mix ash.generate_migrations`"
       ],
+      view?: [
+        type: :boolean,
+        default: false,
+        doc: """
+        Declares that the table is a PostgreSQL view (or materialized view) rather than a base table.
+        View resources are excluded from generated migrations, and records returned from upserts into them carry no `:upsert_action` metadata, since views have no `xmax` system column.
+        """
+      ],
       storage_types: [
         type: :keyword_list,
         default: [],
@@ -986,6 +994,9 @@ defmodule AshPostgres.DataLayer do
       resource,
       AshPostgres.SqlImplementation
     )
+  rescue
+    e ->
+      handle_raised_error(e, __STACKTRACE__, original_query, resource)
   end
 
   @impl true
@@ -1138,13 +1149,16 @@ defmodule AshPostgres.DataLayer do
       {:error, error} ->
         {:error, error}
     end
+  rescue
+    e ->
+      handle_raised_error(e, __STACKTRACE__, query, destination_resource)
   end
 
   @impl true
   def run_query_with_lateral_join(
         query,
         root_data,
-        _destination_resource,
+        destination_resource,
         path
       ) do
     {calculations_require_rewrite, aggregates_require_rewrite, query} =
@@ -1194,6 +1208,9 @@ defmodule AshPostgres.DataLayer do
       {:error, error} ->
         {:error, error}
     end
+  rescue
+    e ->
+      handle_raised_error(e, __STACKTRACE__, query, destination_resource)
   end
 
   defp lateral_join_query(
@@ -3382,6 +3399,20 @@ defmodule AshPostgres.DataLayer do
     {:error, :no_rollback, Ash.Error.from_json(exception, input)}
   end
 
+  # PostgreSQL rejects text that is not valid UTF-8 or contains a NUL byte with
+  # `22021 character_not_in_repertoire`. Only the data layer knows this storage has that
+  # limit (ETS and Mnesia store such values), and the error names no column, so the
+  # attribute is found by looking at the changes. This clause has to come before the
+  # generic `Postgrex.Error` clauses below, which only look for constraint violations.
+  defp handle_raised_error(
+         %Postgrex.Error{postgres: %{code: :character_not_in_repertoire, message: message}},
+         stacktrace,
+         context,
+         resource
+       ) do
+    handle_raised_error(repertoire_error(context, message), stacktrace, context, resource)
+  end
+
   defp handle_raised_error(
          %Postgrex.Error{} = error,
          stacktrace,
@@ -3408,6 +3439,23 @@ defmodule AshPostgres.DataLayer do
        )
        when action in [:insert, :update, :delete] do
     handle_postgrex_error(error, stacktrace, changeset, resource, action)
+  end
+
+  # Postgrex raises this when a parameter cannot be encoded for its column type. The
+  # common case is an integer outside the `bigint` range: `Ash.Type.Integer` accepts any
+  # Elixir integer, because other data layers have no such limit, so only the data layer
+  # can reject it. The error carries only a message, which is not parsed, so the value
+  # and the attribute are not reported.
+  defp handle_raised_error(%DBConnection.EncodeError{}, stacktrace, context, resource) do
+    handle_raised_error(encode_error(context), stacktrace, context, resource)
+  end
+
+  # Ecto wraps an exception raised while compiling a subquery (a paginated or limited
+  # query, a lateral join) and keeps the original in `exception`. Handle that one, so a
+  # cast error inside a subquery converts the same way as one at the top level.
+  defp handle_raised_error(%Ecto.SubQueryError{exception: inner}, stacktrace, context, resource)
+       when is_exception(inner) do
+    handle_raised_error(inner, stacktrace, context, resource)
   end
 
   defp handle_raised_error(%Ecto.Query.CastError{} = e, stacktrace, context, resource) do
@@ -3448,6 +3496,17 @@ defmodule AshPostgres.DataLayer do
   defp handle_raised_error(error, stacktrace, _ecto_changeset, _resource) do
     {:error, Ash.Error.to_ash_error(error, stacktrace)}
   end
+
+  @encode_error_message "a value does not fit the type of its column"
+
+  defp encode_error({:ecto_changeset, _action, _changeset}),
+    do: Ash.Error.Changes.InvalidChanges.exception(message: @encode_error_message)
+
+  defp encode_error({:bulk_create, _fake_changeset}),
+    do: Ash.Error.Changes.InvalidChanges.exception(message: @encode_error_message)
+
+  defp encode_error(_query),
+    do: Ash.Error.Query.InvalidFilterValue.exception(message: @encode_error_message)
 
   defp duration_types_hint do
     """
@@ -3508,6 +3567,37 @@ defmodule AshPostgres.DataLayer do
   end
 
   defp maybe_foreign_key_violation_constraints(_), do: []
+
+  defp repertoire_error({:ecto_changeset, _action, %Ecto.Changeset{changes: changes}}, message) do
+    case Enum.filter(changes, fn {_field, value} -> unstorable_text?(value) end) do
+      [] ->
+        Ash.Error.Changes.InvalidChanges.exception(message: message)
+
+      fields ->
+        Enum.map(fields, fn {field, value} ->
+          Ash.Error.Changes.InvalidAttribute.exception(
+            field: field,
+            value: value,
+            message: message
+          )
+        end)
+    end
+  end
+
+  # The changeset built for a create's rescue carries no changes, so the attribute
+  # cannot be named here
+  defp repertoire_error({:bulk_create, _fake_changeset}, message) do
+    Ash.Error.Changes.InvalidChanges.exception(message: message)
+  end
+
+  defp repertoire_error(_query, message) do
+    Ash.Error.Query.InvalidFilterValue.exception(message: message)
+  end
+
+  defp unstorable_text?(value) when is_binary(value),
+    do: not String.valid?(value) or String.contains?(value, <<0>>)
+
+  defp unstorable_text?(_value), do: false
 
   defp constraints_to_errors(
          %{constraints: user_constraints} = changeset,
